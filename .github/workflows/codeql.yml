@@ -1,74 +1,76 @@
-# For most projects, this workflow file will not need changing; you simply need
-# to commit it to your repository.
-#
-# You may wish to alter this file to override the set of languages analyzed,
-# or to provide custom queries or build logic.
-#
-# ******** NOTE ********
-# We have attempted to detect the languages in your repository. Please check
-# the `language` matrix defined below to confirm you have the correct set of
-# supported CodeQL languages.
-#
-name: "CodeQL"
+name: Jenkins Security Scan
 
 on:
-  push:
-    branches: [ "main" ]
-  pull_request:
-    # The branches below must be a subset of the branches above
-    branches: [ "main" ]
-  schedule:
-    - cron: '18 19 * * 1'
+  workflow_call:
+    inputs:
+      java-version:
+        description: Version of Java set up for the build. See actions/setup-java documentation for values.
+        type: string
+        required: true
+      java-cache:
+        description: What kind of Java dependency cache to set up. See actions/setup-java documentation for values.
+        type: string
+        required: false
+
+permissions:
+  security-events: write
+
+  # Private repo support
+  contents: read # For actions/checkout
+  actions: read # For github/codeql-action/upload-sarif
 
 jobs:
-  analyze:
-    name: Analyze
+  scan:
     runs-on: ubuntu-latest
-    permissions:
-      actions: read
-      contents: read
-      security-events: write
-
-    strategy:
-      fail-fast: false
-      matrix:
-        language: [none]
-        # CodeQL supports [ 'cpp', 'csharp', 'go', 'java', 'javascript', 'python', 'ruby' ]
-        # Learn more about CodeQL language support at https://aka.ms/codeql-docs/language-support
-
     steps:
-    - name: Checkout repository
-      uses: actions/checkout@v3
-
-    # Initializes the CodeQL tools for scanning.
-    - name: Initialize CodeQL
-      uses: github/codeql-action/init@v2
-      with:
-        languages: ${{ matrix.language }}
-        # If you wish to specify custom queries, you can do so here or in a config file.
-        # By default, queries listed here will override any specified in a config file.
-        # Prefix the list here with "+" to use these queries and those in the config file.
-
-        # Details on CodeQL's query packs refer to : https://docs.github.com/en/code-security/code-scanning/automatically-scanning-your-code-for-vulnerabilities-and-errors/configuring-code-scanning#using-queries-in-ql-packs
-        # queries: security-extended,security-and-quality
-
-
-    # Autobuild attempts to build any compiled languages  (C/C++, C#, Go, or Java).
-    # If this step fails, then you should remove it and run the build manually (see below)
-    - name: Autobuild
-      uses: github/codeql-action/autobuild@v2
-
-    # ℹ️ Command-line programs to run using the OS shell.
-    # 📚 See https://docs.github.com/en/actions/using-workflows/workflow-syntax-for-github-actions#jobsjob_idstepsrun
-
-    #   If the Autobuild fails above, remove it and uncomment the following three lines.
-    #   modify them (or add more) to build your code if your project, please refer to the EXAMPLE below for guidance.
-
-    # - run: |
-    #   echo "Run, Build Application using script"
-    #   ./location_of_script_within_repo/buildscript.sh
-
-    - name: Perform CodeQL Analysis
-      uses: github/codeql-action/analyze@v2
-      with:
-        category: "/language:${{matrix.language}}"
+      - name: Check out plugin
+        uses: actions/checkout@v3
+      - name: Check out Jenkins code scanning rules
+        uses: actions/checkout@v3
+        with:
+          repository: jenkins-infra/jenkins-codeql
+          path: jenkins-security-scan-rules
+      - name: Install CodeQL CLI
+        uses: jenkins-infra/fetch-codeql-action@v1
+        with:
+          version: v2.11.2
+      - name: Install jq
+        run: |
+          sudo apt-get update
+          sudo apt-get install jq
+      - name: Set up Java
+        uses: actions/setup-java@v3
+        with:
+          distribution: 'temurin'
+          java-version: ${{ inputs.java-version }}
+          cache: ${{ inputs.java-cache }}
+      - name: Run Scan
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          CODEQL_RULES_DIR: ${{ github.workspace }}/jenkins-security-scan-rules
+          CHECKOUT_DIR: ${{ github.workspace }}
+        run: |
+          set -o errexit
+          set -o nounset
+          set -o pipefail
+          
+          codeql pack install "$CODEQL_RULES_DIR/src/"
+          echo "::group::Create Database"
+          LGTM_INDEX_XML_MODE=all codeql database create --language=java --source-root="$CHECKOUT_DIR" "$GITHUB_WORKSPACE/database" || { echo "Failed to create database" >&2 ; exit 1 ; }
+          echo "::endgroup::"
+          echo "::group::Analyze Database"
+          codeql database analyze --sarif-add-query-help --format=sarifv2.1.0 --output=output.sarif "$GITHUB_WORKSPACE/database" "$CODEQL_RULES_DIR/src/" || { echo "Failed to analyze database" >&2 ; exit 1 ; }
+          echo "::endgroup::"
+          # Prevent conflicts with otherwise set up CodeQL scan
+          jq 'setpath(path(.runs[].tool.driver.name); "Jenkins Security Scan") | setpath(path(.runs[].tool.driver.organization); "Jenkins Project")' output.sarif > jenkins-security-scan.sarif
+      - name: Archive SARIF
+        uses: actions/upload-artifact@v3
+        with:
+          path: jenkins-security-scan.sarif
+          name: Jenkins Security Scan SARIF
+      - name: Upload Scan Result
+        uses: github/codeql-action/upload-sarif@v2
+        with:
+          sarif_file: jenkins-security-scan.sarif
+          category: Jenkins Security Scan
